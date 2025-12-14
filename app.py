@@ -34,9 +34,14 @@ def extend_video(input_path, output_path, quality_mode="balanced", extension_fac
     if duration < 5 or duration > 60:
         raise ValueError("Video must be 5-60 seconds!")
 
-    # Output writer
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    # Output writer with H.264 codec (better quality, universal compatibility)
+    fourcc = cv2.VideoWriter_fourcc(*'avc1')  # H.264 codec
     out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+    
+    # Fallback to mp4v if H.264 fails
+    if not out.isOpened():
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
 
     # Initialize optical flow
     if quality_mode == "fast":
@@ -151,20 +156,23 @@ def interpolate_frame_advanced(prev_frame, curr_frame, prev_gray, curr_gray,
     h, w = prev_frame.shape[:2]
     y_coords, x_coords = np.mgrid[0:h, 0:w].astype(np.float32)
     
-    # Forward interpolation
+    # Forward interpolation with better border handling
     flow_scaled = alpha * flow
     map_x = x_coords + flow_scaled[:, :, 0]
     map_y = y_coords + flow_scaled[:, :, 1]
-    forward_interp = cv2.remap(prev_frame, map_x, map_y, cv2.INTER_CUBIC)
+    forward_interp = cv2.remap(prev_frame, map_x, map_y, cv2.INTER_CUBIC, 
+                               borderMode=cv2.BORDER_REPLICATE)
     
-    # Backward interpolation (estimate reverse flow)
+    # Backward interpolation (estimate reverse flow) with better border handling
     flow_reverse = -(1 - alpha) * flow
     map_x_back = x_coords + flow_reverse[:, :, 0]
     map_y_back = y_coords + flow_reverse[:, :, 1]
-    backward_interp = cv2.remap(curr_frame, map_x_back, map_y_back, cv2.INTER_CUBIC)
+    backward_interp = cv2.remap(curr_frame, map_x_back, map_y_back, cv2.INTER_CUBIC,
+                                borderMode=cv2.BORDER_REPLICATE)
     
     # Occlusion detection via forward-backward consistency
-    warped_back = cv2.remap(flow, map_x, map_y, cv2.INTER_LINEAR)
+    warped_back = cv2.remap(flow, map_x, map_y, cv2.INTER_LINEAR,
+                            borderMode=cv2.BORDER_CONSTANT, borderValue=0)
     consistency = np.sum((flow + warped_back) ** 2, axis=2)
     occlusion_mask = consistency > 2.0
     
@@ -219,11 +227,11 @@ def temporal_stabilize(frame, frame_buffer, alpha):
         stabilized += prev.astype(np.float32) * weight
         weights.append(weight)
     
-    stabilized = stabilized / sum(weights)
+    # Ensure valid range before conversion
+    stabilized = np.clip(stabilized / sum(weights), 0, 255).astype(np.uint8)
     
     # Gentle edge-preserving filter
-    stabilized = cv2.bilateralFilter(stabilized.astype(np.uint8), 
-                                     d=5, sigmaColor=30, sigmaSpace=30)
+    stabilized = cv2.bilateralFilter(stabilized, d=5, sigmaColor=30, sigmaSpace=30)
     
     return stabilized
 
