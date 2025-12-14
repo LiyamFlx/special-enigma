@@ -91,24 +91,21 @@ def extend_video(input_path, output_path, quality_mode="balanced", extension_fac
             )
             
             # === CRITICAL: Temporal stabilization to reduce jitter ===
-            interpolated = temporal_stabilize(interpolated, frame_buffer, alpha)
+            if len(frame_buffer) > 0:
+                interpolated = temporal_stabilize(interpolated, frame_buffer, alpha)
             
             # === Motion blur for natural motion (eliminates "steppy" feel) ===
-            if quality_mode in ["balanced", "quality"]:
-                interpolated = add_motion_blur(interpolated, flow, alpha)
-            
-            # Update buffer
-            frame_buffer.append(interpolated.copy())
-            if len(frame_buffer) > max_buffer_size:
-                frame_buffer.pop(0)
+            # Disabled by default - can cause flicker
+            # if quality_mode == "quality" and avg_motion > 5:
+            #     interpolated = add_motion_blur(interpolated, flow, alpha)
             
             out.write(interpolated)
         
         # Write original current frame
         out.write(curr_frame)
-        frame_buffer.append(curr_frame.copy())
-        if len(frame_buffer) > max_buffer_size:
-            frame_buffer.pop(0)
+        
+        # Update buffer with original frame only (not interpolated)
+        frame_buffer = [curr_frame.copy()]
 
         prev_frame = curr_frame
         prev_gray = curr_gray
@@ -214,24 +211,15 @@ def interpolate_frame_advanced(prev_frame, curr_frame, prev_gray, curr_gray,
 
 def temporal_stabilize(frame, frame_buffer, alpha):
     """Stabilize frame using temporal consistency with buffer"""
-    if len(frame_buffer) < 2:
+    if len(frame_buffer) < 1:
         return frame
     
-    # Weighted average with recent frames (reduces jitter)
-    stabilized = frame.astype(np.float32)
-    weights = [0.7]  # Current frame weight
+    # Very gentle temporal smoothing to avoid flicker
+    # Only blend with immediate previous frame
+    prev_frame = frame_buffer[-1]
     
-    # Add influence from previous frames
-    for i, prev in enumerate(frame_buffer[-2:]):
-        weight = 0.15 / (i + 1)  # Decreasing weight for older frames
-        stabilized += prev.astype(np.float32) * weight
-        weights.append(weight)
-    
-    # Ensure valid range before conversion
-    stabilized = np.clip(stabilized / sum(weights), 0, 255).astype(np.uint8)
-    
-    # Gentle edge-preserving filter
-    stabilized = cv2.bilateralFilter(stabilized, d=5, sigmaColor=30, sigmaSpace=30)
+    # Light blend (90% current, 10% previous)
+    stabilized = cv2.addWeighted(frame, 0.9, prev_frame, 0.1, 0)
     
     return stabilized
 
