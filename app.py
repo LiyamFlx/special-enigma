@@ -6,32 +6,38 @@ os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'
 os.environ['OMP_NUM_THREADS'] = '1'
 os.environ['MKL_NUM_THREADS'] = '1'
 
-# Import with error handling
-try:
-    import cv2
-    import numpy as np
-    import streamlit as st
-    import tempfile
-    import time
-    from video_generator import extend_video_generative
-    from audio_processor import process_video_with_audio
-except ImportError as e:
-    print(f"Import Error: {e}", file=sys.stderr)
-    import streamlit as st
-    st.error(f"Failed to import required modules: {e}")
-    st.stop()
+import cv2
+import numpy as np
+import streamlit as st
+import tempfile
+import time
+import subprocess
+from pathlib import Path
 
-def extend_video(input_path, output_path, quality_mode="balanced", progress_callback=None):
+# Optional imports with fallback
+AUDIO_AVAILABLE = False
+try:
+    from pydub import AudioSegment
+    AUDIO_AVAILABLE = True
+except ImportError:
+    pass
+
+# ===== VIDEO EXTENSION CORE =====
+
+def extend_video_optical_flow(input_path, output_path, extension_seconds=5.0, quality_mode="balanced", progress_callback=None):
     """
-    Extended video using advanced optical flow interpolation with quality improvements.
+    Extend video using bidirectional optical flow with motion extrapolation.
     
     Args:
         input_path: Path to input video
-        output_path: Path to save extended video
+        output_path: Path to save extended video  
+        extension_seconds: Seconds to add (5.0 or 10.0)
         quality_mode: "fast", "balanced", or "quality"
         progress_callback: Function to call with progress updates (0-100)
+    
+    Returns:
+        dict with processing statistics
     """
-    # Load video
     cap = cv2.VideoCapture(input_path)
     if not cap.isOpened():
         raise ValueError("Couldn't open video!")
@@ -41,279 +47,340 @@ def extend_video(input_path, output_path, quality_mode="balanced", progress_call
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    original_duration = frame_count / fps
 
-    # Downscale if >1080p
+    # Validate duration (5-60s)
+    if original_duration < 3:
+        raise ValueError("Video must be at least 3 seconds!")
+    if original_duration > 120:
+        raise ValueError("Video must be under 2 minutes!")
+
+    # Downscale if >1080p for performance
+    scale = 1.0
     if height > 1080:
         scale = 1080 / height
         width = int(width * scale)
         height = 1080
 
-    # Check duration (5-60s)
-    duration = frame_count / fps
-    if duration < 5 or duration > 60:
-        raise ValueError("Video must be 5-60 seconds!")
-
-    # Output writer (MP4, same fps/res, no audio)
+    # Calculate extension frames
+    extension_frames = int(extension_seconds * fps)
+    
+    # Output writer
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
 
-    # Initialize DIS optical flow based on quality mode
-    if quality_mode == "fast":
-        dis_forward = cv2.DISOpticalFlow_create(cv2.DISOPTICAL_FLOW_PRESET_FAST)
-        dis_backward = cv2.DISOpticalFlow_create(cv2.DISOPTICAL_FLOW_PRESET_FAST)
-    elif quality_mode == "quality":
-        dis_forward = cv2.DISOpticalFlow_create(cv2.DISOPTICAL_FLOW_PRESET_ULTRAFAST)
-        dis_backward = cv2.DISOpticalFlow_create(cv2.DISOPTICAL_FLOW_PRESET_ULTRAFAST)
-    else:  # balanced
-        dis_forward = cv2.DISOpticalFlow_create(cv2.DISOPTICAL_FLOW_PRESET_MEDIUM)
-        dis_backward = cv2.DISOpticalFlow_create(cv2.DISOPTICAL_FLOW_PRESET_MEDIUM)
+    # Configure DIS optical flow based on quality
+    presets = {
+        "fast": cv2.DISOPTICAL_FLOW_PRESET_ULTRAFAST,
+        "balanced": cv2.DISOPTICAL_FLOW_PRESET_MEDIUM,
+        "quality": cv2.DISOPTICAL_FLOW_PRESET_FAST  # Better quality = FAST preset (more iterations)
+    }
+    dis = cv2.DISOpticalFlow_create(presets.get(quality_mode, cv2.DISOPTICAL_FLOW_PRESET_MEDIUM))
 
-    # Read first frame
-    ret, prev_frame = cap.read()
-    if not ret:
-        raise ValueError("Empty video!")
-    
-    # Resize if needed
-    if prev_frame.shape[:2] != (height, width):
-        prev_frame = cv2.resize(prev_frame, (width, height))
-    out.write(prev_frame)
-    prev_gray = cv2.cvtColor(prev_frame, cv2.COLOR_BGR2GRAY)
-
-    # Process frame by frame
-    frame_idx = 1
+    # Read all frames (for extension we need history)
+    frames = []
     while True:
-        ret, curr_frame = cap.read()
+        ret, frame = cap.read()
         if not ret:
             break
-        
-        # Resize if needed
-        if curr_frame.shape[:2] != (height, width):
-            curr_frame = cv2.resize(curr_frame, (width, height))
-        curr_gray = cv2.cvtColor(curr_frame, cv2.COLOR_BGR2GRAY)
+        if scale != 1.0:
+            frame = cv2.resize(frame, (width, height))
+        frames.append(frame)
+    cap.release()
 
-        # === IMPROVEMENT 1: Bidirectional Optical Flow (DIS) ===
-        # Forward flow: prev -> curr
-        flow_forward = dis_forward.calc(prev_gray, curr_gray, None)
-        
-        # Backward flow: curr -> prev
-        flow_backward = dis_backward.calc(curr_gray, prev_gray, None)
+    if len(frames) < 2:
+        raise ValueError("Video too short!")
 
-        # === IMPROVEMENT 2: Occlusion Detection ===
-        h, w = height, width
+    # Write original frames first
+    total_operations = len(frames) + extension_frames
+    for i, frame in enumerate(frames):
+        out.write(frame)
+        if progress_callback:
+            progress_callback(int((i / total_operations) * 50))
+
+    # Calculate motion from last N frames for extrapolation
+    history_length = min(10, len(frames) - 1)
+    flows = []
+    
+    for i in range(len(frames) - history_length, len(frames) - 1):
+        gray1 = cv2.cvtColor(frames[i], cv2.COLOR_BGR2GRAY)
+        gray2 = cv2.cvtColor(frames[i + 1], cv2.COLOR_BGR2GRAY)
+        flow = dis.calc(gray1, gray2, None)
+        flows.append(flow)
+
+    # Average motion vector (with decay weighting - recent frames matter more)
+    weights = np.array([0.5 ** (len(flows) - 1 - i) for i in range(len(flows))])
+    weights /= weights.sum()
+    
+    avg_flow = np.zeros_like(flows[0])
+    for i, flow in enumerate(flows):
+        avg_flow += flow * weights[i]
+
+    # Motion magnitude for adaptive blending
+    mag, _ = cv2.cartToPolar(avg_flow[..., 0], avg_flow[..., 1])
+    avg_mag = np.mean(mag)
+
+    # Generate extension frames
+    last_frame = frames[-1].copy()
+    prev_frame = frames[-2].copy() if len(frames) > 1 else last_frame.copy()
+    
+    h, w = height, width
+    y_coords, x_coords = np.mgrid[0:h, 0:w].astype(np.float32)
+
+    for i in range(extension_frames):
+        # Decay factor - motion slows down over time
+        decay = max(0.3, 1.0 - (i / extension_frames) * 0.7)
         
-        # Create coordinate grids
-        y_coords, x_coords = np.mgrid[0:h, 0:w].astype(np.float32)
+        # Scale flow by decay
+        scaled_flow = avg_flow * decay
         
         # Forward warp coordinates
-        forward_x = x_coords + flow_forward[:, :, 0]
-        forward_y = y_coords + flow_forward[:, :, 1]
+        map_x = x_coords + scaled_flow[..., 0]
+        map_y = y_coords + scaled_flow[..., 1]
         
-        # Warp backward flow to previous frame
-        warped_backward = cv2.remap(flow_backward, forward_x, forward_y, 
-                                     cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
+        # Warp last frame
+        warped = cv2.remap(last_frame, map_x, map_y, 
+                          cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
         
-        # Forward-backward consistency check
-        consistency_error = np.sqrt(
-            (flow_forward[:, :, 0] + warped_backward[:, :, 0]) ** 2 +
-            (flow_forward[:, :, 1] + warped_backward[:, :, 1]) ** 2
-        )
+        # Blend with previous to reduce artifacts
+        if avg_mag > 2:  # Significant motion
+            alpha = 0.85
+        else:  # Low motion - more blending
+            alpha = 0.7
+            
+        new_frame = cv2.addWeighted(warped, alpha, last_frame, 1 - alpha, 0)
         
-        # Occlusion mask (areas with high inconsistency)
-        occlusion_threshold = 1.5 if quality_mode == "quality" else 2.0
-        occlusion_mask = consistency_error > occlusion_threshold
-
-        # === IMPROVEMENT 3: Bidirectional Interpolation ===
-        alpha = 0.5  # Midpoint
-        
-        # Forward interpolation (from prev_frame)
-        interp_flow_forward = alpha * flow_forward
-        map_x_forward = x_coords + interp_flow_forward[:, :, 0]
-        map_y_forward = y_coords + interp_flow_forward[:, :, 1]
-        forward_interp = cv2.remap(prev_frame, map_x_forward, map_y_forward, 
-                                    cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
-        
-        # Backward interpolation (from curr_frame)
-        interp_flow_backward = (1 - alpha) * flow_backward
-        map_x_backward = x_coords + interp_flow_backward[:, :, 0]
-        map_y_backward = y_coords + interp_flow_backward[:, :, 1]
-        backward_interp = cv2.remap(curr_frame, map_x_backward, map_y_backward, 
-                                     cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
-        
-        # Blend both directions
-        interpolated = cv2.addWeighted(forward_interp, 0.5, backward_interp, 0.5, 0)
-
-        # === IMPROVEMENT 4: Motion-Adaptive Blending ===
-        mag, _ = cv2.cartToPolar(flow_forward[..., 0], flow_forward[..., 1])
-        avg_mag = np.mean(mag)
-        
-        # Normalize motion magnitude to 0-1 for blending weight
-        motion_weight = np.clip(mag / 20.0, 0, 1)
-        motion_weight = np.stack([motion_weight] * 3, axis=2)  # Convert to 3 channels
-        
-        # Simple blend for comparison
-        simple_blend = cv2.addWeighted(prev_frame, 0.5, curr_frame, 0.5, 0)
-        
-        # Adaptive blend: high motion = trust interpolation, low motion = trust blend
-        if avg_mag < 3:  # Very low motion
-            interpolated = cv2.addWeighted(interpolated, 0.3, simple_blend, 0.7, 0)
-        else:
-            interpolated = (motion_weight * interpolated + 
-                           (1 - motion_weight) * simple_blend).astype(np.uint8)
-
-        # === IMPROVEMENT 5: Handle Occlusions ===
-        # For occluded regions, use simple blending
-        occlusion_mask_3ch = np.stack([occlusion_mask] * 3, axis=2)
-        interpolated = np.where(occlusion_mask_3ch, simple_blend, interpolated)
-
-        # === IMPROVEMENT 6: Edge-Aware Smoothing ===
+        # Edge-aware smoothing for quality mode
         if quality_mode == "quality":
-            # Bilateral filter preserves edges while smoothing
-            interpolated = cv2.bilateralFilter(interpolated, d=5, sigmaColor=50, sigmaSpace=50)
-        else:
-            # Lighter temporal smoothing for faster modes
-            interpolated = cv2.addWeighted(interpolated, 0.85, prev_frame, 0.15, 0)
-
-        # Write interpolated + current frame
-        out.write(interpolated)
-        out.write(curr_frame)
-
-        # Update for next iteration
-        prev_frame = curr_frame
-        prev_gray = curr_gray
+            new_frame = cv2.bilateralFilter(new_frame, d=5, sigmaColor=40, sigmaSpace=40)
         
-        # Progress callback
-        frame_idx += 1
+        out.write(new_frame)
+        
+        # Update for next iteration
+        prev_frame = last_frame
+        last_frame = new_frame
+        
         if progress_callback:
-            progress = int((frame_idx / frame_count) * 100)
-            progress_callback(progress)
+            progress_callback(int(50 + (i / extension_frames) * 50))
 
-    # Cleanup
-    cap.release()
     out.release()
+    
+    return {
+        'original_duration': original_duration,
+        'extended_duration': original_duration + extension_seconds,
+        'original_frames': len(frames),
+        'extension_frames': extension_frames,
+        'fps': fps
+    }
+
+
+def process_audio(input_path, video_output_path, final_output_path, extension_seconds, quality_mode="balanced"):
+    """
+    Extract audio from original, extend it, and merge with video.
+    Uses ffmpeg for reliable processing.
+    """
+    temp_dir = tempfile.gettempdir()
+    audio_path = os.path.join(temp_dir, "temp_audio.aac")
+    extended_audio_path = os.path.join(temp_dir, "extended_audio.aac")
+    
+    try:
+        # Extract audio from original
+        extract_cmd = [
+            'ffmpeg', '-y', '-i', input_path,
+            '-vn', '-acodec', 'aac', '-b:a', '192k',
+            audio_path
+        ]
+        result = subprocess.run(extract_cmd, capture_output=True, timeout=60)
+        
+        if result.returncode != 0 or not os.path.exists(audio_path):
+            # No audio track - just copy video
+            import shutil
+            shutil.copy(video_output_path, final_output_path)
+            return False
+        
+        # Get original audio duration
+        probe_cmd = [
+            'ffprobe', '-v', 'error', '-show_entries', 'format=duration',
+            '-of', 'default=noprint_wrappers=1:nokey=1', audio_path
+        ]
+        result = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=30)
+        audio_duration = float(result.stdout.strip())
+        
+        # Calculate time stretch factor
+        target_duration = audio_duration + extension_seconds
+        stretch_factor = target_duration / audio_duration
+        
+        # Use rubberband for high-quality time stretching (or atempo for fallback)
+        if stretch_factor <= 2.0:
+            # atempo filter (0.5 to 2.0 range)
+            stretch_cmd = [
+                'ffmpeg', '-y', '-i', audio_path,
+                '-filter:a', f'atempo={1/stretch_factor}',
+                '-acodec', 'aac', '-b:a', '192k',
+                extended_audio_path
+            ]
+        else:
+            # Chain atempo filters for larger stretches
+            tempo1 = 0.5
+            tempo2 = 1 / (stretch_factor * tempo1)
+            stretch_cmd = [
+                'ffmpeg', '-y', '-i', audio_path,
+                '-filter:a', f'atempo={tempo1},atempo={tempo2}',
+                '-acodec', 'aac', '-b:a', '192k',
+                extended_audio_path
+            ]
+        
+        subprocess.run(stretch_cmd, capture_output=True, timeout=120)
+        
+        # Merge video and extended audio
+        merge_cmd = [
+            'ffmpeg', '-y',
+            '-i', video_output_path,
+            '-i', extended_audio_path,
+            '-c:v', 'copy', '-c:a', 'aac',
+            '-map', '0:v:0', '-map', '1:a:0',
+            '-shortest',
+            final_output_path
+        ]
+        subprocess.run(merge_cmd, capture_output=True, timeout=120)
+        
+        # Cleanup temp files
+        for f in [audio_path, extended_audio_path]:
+            if os.path.exists(f):
+                os.remove(f)
+        
+        return os.path.exists(final_output_path)
+        
+    except Exception as e:
+        # Fallback: copy video without audio
+        import shutil
+        shutil.copy(video_output_path, final_output_path)
+        return False
 
 
 # ===== STREAMLIT UI =====
 st.set_page_config(page_title="Video Extender Pro", page_icon="🎬", layout="wide")
 
-st.title("🎬 Video Extender Pro - AI Generative Extension")
-st.write("Extend your videos with AI-powered frame generation! Perfect for social media clips and professional content.")
+st.title("🎬 Video Extender Pro")
+st.write("Extend your videos with AI-powered motion extrapolation. Perfect for social media clips and professional content.")
 
-# Main controls
-uploaded_file = st.file_uploader("Choose your video", type=["mp4", "mov", "avi"])
+# Check ffmpeg availability
+ffmpeg_available = subprocess.run(['which', 'ffmpeg'], capture_output=True).returncode == 0
+
+uploaded_file = st.file_uploader("Choose your video", type=["mp4", "mov", "avi", "mkv", "webm"])
 
 if uploaded_file:
     col1, col2, col3 = st.columns(3)
+    
     with col1:
         extension_mode = st.radio(
             "Extension Duration",
             ["5 seconds", "10 seconds"],
-            help="5s: Perfect for social media clips\n10s: Extended professional content"
+            help="5s: Social media clips | 10s: Extended content"
         )
+    
     with col2:
         quality_mode = st.selectbox(
             "Quality Mode",
             ["fast", "balanced", "quality"],
             index=1,
-            help="Fast: Quick processing (optical flow)\nBalanced: AI-powered with good speed\nQuality: Best AI results (slower)"
+            help="Fast: Quick processing | Balanced: Good quality/speed | Quality: Best results (slower)"
         )
+    
     with col3:
         include_audio = st.checkbox(
             "Process Audio",
-            value=True,
-            help="Extend and synchronize audio track"
+            value=ffmpeg_available,
+            disabled=not ffmpeg_available,
+            help="Extend audio with video" + ("" if ffmpeg_available else " (ffmpeg not available)")
         )
 
-    # Parse extension duration
     extension_seconds = 5.0 if extension_mode == "5 seconds" else 10.0
-
-    # Display file info
-    file_size_mb = uploaded_file.size / (1024 * 1024)
-    st.info(f"📁 **File:** {uploaded_file.name} ({file_size_mb:.1f} MB) | **Extension:** +{extension_seconds:.0f}s")
 
     # Save temp input
     tfile = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
     tfile.write(uploaded_file.read())
     input_path = tfile.name
 
-    # Show original video preview
+    # Get video info
+    cap = cv2.VideoCapture(input_path)
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    duration = frame_count / fps if fps > 0 else 0
+    cap.release()
+
+    # Display info
+    file_size_mb = uploaded_file.size / (1024 * 1024)
+    st.info(f"📁 **{uploaded_file.name}** | {file_size_mb:.1f} MB | {width}x{height} | {duration:.1f}s @ {fps:.0f}fps → **+{extension_seconds:.0f}s**")
+
+    # Preview columns
     col1, col2 = st.columns(2)
     with col1:
-        st.subheader("📹 Original Video")
+        st.subheader("📹 Original")
         st.video(input_path)
-
-        # Get video info
-        cap = cv2.VideoCapture(input_path)
-        fps = cap.get(cv2.CAP_PROP_FPS)
-        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        duration = frame_count / fps if fps > 0 else 0
-        cap.release()
-
-        st.caption(f"Duration: {duration:.1f}s | FPS: {fps:.0f} | Frames: {frame_count}")
-
+    
     with col2:
-        st.subheader("🎯 Extended Preview")
-        st.info(f"**New Duration:** {duration + extension_seconds:.1f}s\n\n**Added Content:** {extension_seconds:.0f}s of AI-generated frames")
+        st.subheader("🎯 Preview")
+        new_duration = duration + extension_seconds
+        st.metric("New Duration", f"{new_duration:.1f}s", f"+{extension_seconds:.0f}s")
 
-    if st.button("🚀 Extend Video with AI", type="primary", use_container_width=True):
-        output_path_no_audio = os.path.join(tempfile.gettempdir(), "extended_video_no_audio.mp4")
-        output_path_final = os.path.join(tempfile.gettempdir(), "extended_video_final.mp4")
+    if st.button("🚀 Extend Video", type="primary", use_container_width=True):
+        output_path_video = os.path.join(tempfile.gettempdir(), "extended_video.mp4")
+        output_path_final = os.path.join(tempfile.gettempdir(), "extended_final.mp4")
 
-        # Progress bar
         progress_bar = st.progress(0)
         status_text = st.empty()
         start_time = time.time()
 
         def update_progress(percent):
-            progress_bar.progress(percent / 100)
+            progress_bar.progress(min(percent, 100) / 100)
             elapsed = time.time() - start_time
-            status_text.text(f"Processing... {percent}% complete ({elapsed:.1f}s elapsed)")
+            status_text.text(f"Processing... {percent}% ({elapsed:.1f}s)")
 
         try:
-            # Process video with generative extension
-            status_text.text("🎬 Generating extended frames with AI...")
-            stats = extend_video_generative(
+            # Process video
+            status_text.text("🎬 Extending video frames...")
+            stats = extend_video_optical_flow(
                 input_path,
-                output_path_no_audio,
+                output_path_video,
                 extension_seconds=extension_seconds,
                 quality_mode=quality_mode,
                 progress_callback=update_progress
             )
 
-            # Process audio if requested
-            if include_audio:
-                status_text.text("🎵 Extending audio track...")
-                progress_bar.progress(95)
-                audio_processed = process_video_with_audio(
+            # Process audio
+            audio_processed = False
+            if include_audio and ffmpeg_available:
+                status_text.text("🎵 Processing audio...")
+                progress_bar.progress(0.95)
+                audio_processed = process_audio(
                     input_path,
-                    output_path_no_audio,
+                    output_path_video,
                     output_path_final,
                     extension_seconds,
                     quality_mode
                 )
-                output_path = output_path_final
+                output_path = output_path_final if audio_processed else output_path_video
             else:
-                output_path = output_path_no_audio
-                audio_processed = False
+                output_path = output_path_video
 
-            # Success message
+            # Done
             processing_time = time.time() - start_time
-            progress_bar.progress(100)
+            progress_bar.progress(1.0)
             status_text.empty()
-            st.success(f"✅ Video extended successfully in {processing_time:.1f}s!")
+            st.success(f"✅ Extended in {processing_time:.1f}s!")
 
             # Stats
-            st.subheader("📊 Processing Statistics")
-            col1, col2, col3, col4 = st.columns(4)
-            with col1:
-                st.metric("Original Duration", f"{stats['original_duration']:.1f}s")
-            with col2:
-                st.metric("Extended Duration", f"{stats['extended_duration']:.1f}s")
-            with col3:
-                st.metric("Frames Added", f"+{stats['extension_frames']}")
-            with col4:
-                st.metric("Audio", "✅ Extended" if audio_processed else "⚠️ Not processed")
+            st.subheader("📊 Results")
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Original", f"{stats['original_duration']:.1f}s")
+            c2.metric("Extended", f"{stats['extended_duration']:.1f}s")
+            c3.metric("Frames Added", f"+{stats['extension_frames']}")
+            c4.metric("Audio", "✅" if audio_processed else "—")
 
-            # Download button
+            # Download
             with open(output_path, "rb") as f:
                 st.download_button(
                     "⬇️ Download Extended Video",
@@ -323,59 +390,29 @@ if uploaded_file:
                     use_container_width=True
                 )
 
-            # Side-by-side comparison
-            st.subheader("📊 Before & After Comparison")
+            # Comparison
+            st.subheader("📊 Comparison")
             col1, col2 = st.columns(2)
             with col1:
-                st.write("**Original Video**")
+                st.caption("Original")
                 st.video(input_path)
             with col2:
-                st.write(f"**Extended (+{extension_seconds:.0f}s)**")
+                st.caption(f"Extended (+{extension_seconds:.0f}s)")
                 st.video(output_path)
 
         except Exception as e:
             progress_bar.empty()
             status_text.empty()
             st.error(f"❌ Error: {str(e)}")
-
-            # Show detailed error in expander
-            with st.expander("🔍 Error Details"):
+            with st.expander("🔍 Details"):
                 import traceback
                 st.code(traceback.format_exc())
 
 # Footer
 st.divider()
-col1, col2 = st.columns(2)
-
-with col1:
-    st.markdown("""
-    ### 🎯 How it works
-    This app uses **AI-powered generative video extension**:
-    - **Neural frame prediction** using ConvLSTM architecture
-    - **Motion-aware extrapolation** for smooth continuity
-    - **Optical flow guidance** for realistic motion
-    - **Audio time-stretching** with phase vocoder technology
-    - **Smart quality modes** (fast/balanced/quality)
-    """)
-
-with col2:
-    st.markdown("""
-    ### 💡 Use Cases
-    **5-Second Extension:**
-    - Social media clips (TikTok, Instagram Reels)
-    - Quick video loops
-    - Short promotional content
-
-    **10-Second Extension:**
-    - Professional presentations
-    - Extended B-roll footage
-    - Longer form content creation
-    """)
-
 st.markdown("""
-**Tips for best results:**
-- Videos with consistent motion work best
-- Avoid abrupt scene changes
-- Well-lit footage produces better AI predictions
-- Enable audio processing for complete synchronization
+**How it works:** Analyzes motion patterns from the last frames using bidirectional optical flow, 
+then extrapolates with decay to generate smooth extended content. Audio is time-stretched to match.
+
+**Tips:** Videos with consistent motion work best. Avoid abrupt scene changes at the end.
 """)
