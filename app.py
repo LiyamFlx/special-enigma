@@ -3,6 +3,9 @@ import numpy as np
 import streamlit as st
 import os
 import tempfile
+from video_generator import extend_video_generative
+from audio_processor import process_video_with_audio
+import time
 
 def extend_video(input_path, output_path, quality_mode="balanced", progress_callback=None):
     """
@@ -176,111 +179,189 @@ def extend_video(input_path, output_path, quality_mode="balanced", progress_call
 
 
 # ===== STREAMLIT UI =====
-st.set_page_config(page_title="Video Extender Pro", page_icon="🎬", layout="centered")
+st.set_page_config(page_title="Video Extender Pro", page_icon="🎬", layout="wide")
 
-st.title("🎬 Video Extender Pro")
-st.write("Upload a short clip (5-60s, MP4/MOV) and extend it with advanced frame interpolation!")
+st.title("🎬 Video Extender Pro - AI Generative Extension")
+st.write("Extend your videos with AI-powered frame generation! Perfect for social media clips and professional content.")
 
-# Quality mode selector
-col1, col2 = st.columns([2, 1])
-with col1:
-    uploaded_file = st.file_uploader("Choose your video", type=["mp4", "mov", "avi"])
-with col2:
-    quality_mode = st.selectbox(
-        "Quality Mode",
-        ["fast", "balanced", "quality"],
-        index=1,
-        help="Fast: Quick processing\nBalanced: Good quality & speed\nQuality: Best results (slower)"
-    )
+# Main controls
+uploaded_file = st.file_uploader("Choose your video", type=["mp4", "mov", "avi"])
 
-if uploaded_file is not None:
+if uploaded_file:
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        extension_mode = st.radio(
+            "Extension Duration",
+            ["5 seconds", "10 seconds"],
+            help="5s: Perfect for social media clips\n10s: Extended professional content"
+        )
+    with col2:
+        quality_mode = st.selectbox(
+            "Quality Mode",
+            ["fast", "balanced", "quality"],
+            index=1,
+            help="Fast: Quick processing (optical flow)\nBalanced: AI-powered with good speed\nQuality: Best AI results (slower)"
+        )
+    with col3:
+        include_audio = st.checkbox(
+            "Process Audio",
+            value=True,
+            help="Extend and synchronize audio track"
+        )
+
+    # Parse extension duration
+    extension_seconds = 5.0 if extension_mode == "5 seconds" else 10.0
+
     # Display file info
     file_size_mb = uploaded_file.size / (1024 * 1024)
-    st.info(f"📁 **File:** {uploaded_file.name} ({file_size_mb:.1f} MB)")
-    
+    st.info(f"📁 **File:** {uploaded_file.name} ({file_size_mb:.1f} MB) | **Extension:** +{extension_seconds:.0f}s")
+
     # Save temp input
     tfile = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
     tfile.write(uploaded_file.read())
     input_path = tfile.name
 
     # Show original video preview
-    with st.expander("👀 Preview Original Video"):
+    col1, col2 = st.columns(2)
+    with col1:
+        st.subheader("📹 Original Video")
         st.video(input_path)
 
-    if st.button("🚀 Extend Video", type="primary", use_container_width=True):
-        output_path = os.path.join(tempfile.gettempdir(), "extended_video.mp4")
-        
+        # Get video info
+        cap = cv2.VideoCapture(input_path)
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        duration = frame_count / fps if fps > 0 else 0
+        cap.release()
+
+        st.caption(f"Duration: {duration:.1f}s | FPS: {fps:.0f} | Frames: {frame_count}")
+
+    with col2:
+        st.subheader("🎯 Extended Preview")
+        st.info(f"**New Duration:** {duration + extension_seconds:.1f}s\n\n**Added Content:** {extension_seconds:.0f}s of AI-generated frames")
+
+    if st.button("🚀 Extend Video with AI", type="primary", use_container_width=True):
+        output_path_no_audio = os.path.join(tempfile.gettempdir(), "extended_video_no_audio.mp4")
+        output_path_final = os.path.join(tempfile.gettempdir(), "extended_video_final.mp4")
+
         # Progress bar
         progress_bar = st.progress(0)
         status_text = st.empty()
-        
+        start_time = time.time()
+
         def update_progress(percent):
             progress_bar.progress(percent / 100)
-            status_text.text(f"Processing... {percent}% complete")
-        
+            elapsed = time.time() - start_time
+            status_text.text(f"Processing... {percent}% complete ({elapsed:.1f}s elapsed)")
+
         try:
-            # Process video
-            extend_video(input_path, output_path, quality_mode, update_progress)
-            
+            # Process video with generative extension
+            status_text.text("🎬 Generating extended frames with AI...")
+            stats = extend_video_generative(
+                input_path,
+                output_path_no_audio,
+                extension_seconds=extension_seconds,
+                quality_mode=quality_mode,
+                progress_callback=update_progress
+            )
+
+            # Process audio if requested
+            if include_audio:
+                status_text.text("🎵 Extending audio track...")
+                progress_bar.progress(95)
+                audio_processed = process_video_with_audio(
+                    input_path,
+                    output_path_no_audio,
+                    output_path_final,
+                    extension_seconds,
+                    quality_mode
+                )
+                output_path = output_path_final
+            else:
+                output_path = output_path_no_audio
+                audio_processed = False
+
             # Success message
+            processing_time = time.time() - start_time
             progress_bar.progress(100)
             status_text.empty()
-            st.success("✅ Video extended successfully!")
-            
-            # Get file sizes
-            input_size = os.path.getsize(input_path) / (1024 * 1024)
-            output_size = os.path.getsize(output_path) / (1024 * 1024)
-            
+            st.success(f"✅ Video extended successfully in {processing_time:.1f}s!")
+
             # Stats
-            col1, col2, col3 = st.columns(3)
+            st.subheader("📊 Processing Statistics")
+            col1, col2, col3, col4 = st.columns(4)
             with col1:
-                st.metric("Original Size", f"{input_size:.1f} MB")
+                st.metric("Original Duration", f"{stats['original_duration']:.1f}s")
             with col2:
-                st.metric("Extended Size", f"{output_size:.1f} MB")
+                st.metric("Extended Duration", f"{stats['extended_duration']:.1f}s")
             with col3:
-                st.metric("Length", "2x longer")
-            
+                st.metric("Frames Added", f"+{stats['extension_frames']}")
+            with col4:
+                st.metric("Audio", "✅ Extended" if audio_processed else "⚠️ Not processed")
+
             # Download button
             with open(output_path, "rb") as f:
                 st.download_button(
                     "⬇️ Download Extended Video",
                     f,
-                    file_name=f"extended_{uploaded_file.name}",
+                    file_name=f"extended_{int(extension_seconds)}s_{uploaded_file.name}",
                     mime="video/mp4",
                     use_container_width=True
                 )
-            
+
             # Side-by-side comparison
             st.subheader("📊 Before & After Comparison")
             col1, col2 = st.columns(2)
             with col1:
-                st.write("**Original**")
+                st.write("**Original Video**")
                 st.video(input_path)
             with col2:
-                st.write("**Extended (2x)**")
+                st.write(f"**Extended (+{extension_seconds:.0f}s)**")
                 st.video(output_path)
-                
+
         except Exception as e:
             progress_bar.empty()
             status_text.empty()
             st.error(f"❌ Error: {str(e)}")
-            
+
             # Show detailed error in expander
             with st.expander("🔍 Error Details"):
-                st.code(str(e))
+                import traceback
+                st.code(traceback.format_exc())
 
 # Footer
 st.divider()
-st.markdown("""
-### 🎯 How it works
-This app uses **advanced optical flow interpolation** to create smooth in-between frames:
-- **Bidirectional flow analysis** for accurate motion estimation
-- **Occlusion detection** to handle appearing/disappearing objects
-- **Motion-adaptive blending** for different scene types
-- **Edge-preserving smoothing** for artifact-free results
+col1, col2 = st.columns(2)
 
+with col1:
+    st.markdown("""
+    ### 🎯 How it works
+    This app uses **AI-powered generative video extension**:
+    - **Neural frame prediction** using ConvLSTM architecture
+    - **Motion-aware extrapolation** for smooth continuity
+    - **Optical flow guidance** for realistic motion
+    - **Audio time-stretching** with phase vocoder technology
+    - **Smart quality modes** (fast/balanced/quality)
+    """)
+
+with col2:
+    st.markdown("""
+    ### 💡 Use Cases
+    **5-Second Extension:**
+    - Social media clips (TikTok, Instagram Reels)
+    - Quick video loops
+    - Short promotional content
+
+    **10-Second Extension:**
+    - Professional presentations
+    - Extended B-roll footage
+    - Longer form content creation
+    """)
+
+st.markdown("""
 **Tips for best results:**
-- Use videos with smooth, continuous motion
-- Avoid videos with fast cuts or scene changes
-- Well-lit footage works better than dark/grainy video
+- Videos with consistent motion work best
+- Avoid abrupt scene changes
+- Well-lit footage produces better AI predictions
+- Enable audio processing for complete synchronization
 """)
