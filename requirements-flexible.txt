@@ -1,0 +1,25 @@
+# Flexible requirements (without strict version pinning)
+# Use this if requirements.txt fails
+
+# Core dependencies
+opencv-python-headless>=4.8.0
+numpy>=1.24.0
+streamlit>=1.28.0
+
+# Deep Learning (install separately if needed)
+# torch>=2.0.0
+# torchvision>=0.15.0
+
+# Image/Video processing
+einops>=0.7.0
+pillow>=10.0.0
+scipy>=1.10.0
+imageio>=2.30.0
+imageio-ffmpeg>=0.4.8
+
+# Audio processing
+librosa>=0.10.0
+soundfile>=0.12.0
+
+# Utilities
+tqdm>=4.65.0

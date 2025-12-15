@@ -361,7 +361,9 @@ def extend_video_generative(input_path: str, output_path: str,
         progress_callback(90)
 
     context_frames = all_frames[-10:] if len(all_frames) >= 10 else all_frames
-    use_neural = quality_mode in ["balanced", "quality"]
+    # Temporarily disable neural prediction to avoid memory issues
+    # Use optical flow for all modes (more stable)
+    use_neural = False  # TODO: Re-enable with batch processing for memory efficiency
 
     extended_frames = extender.extend_forward(
         context_frames,
