@@ -45,8 +45,9 @@ tmp/
 # Logs
 *.log
 
-# Streamlit
+# Streamlit (but keep config for deployment)
 .streamlit/
+!.streamlit/config.toml
 
 # Video files (don't commit test videos)
 *.mp4

@@ -1,13 +1,16 @@
-opencv-python-headless==4.12.0.88
-numpy==2.2.6
-streamlit==1.52.1
-torch==2.1.0
-torchvision==0.16.0
-einops==0.7.0
-pillow==10.1.0
-scipy==1.11.4
-imageio==2.33.0
-imageio-ffmpeg==0.4.9
-librosa==0.10.1
-soundfile==0.12.1
-tqdm==4.66.1
+# Video Extender Pro - Requirements
+# Compatible with Streamlit Cloud and local environments
+
+opencv-python-headless>=4.8.0,<5.0.0
+numpy>=1.24.0,<2.3.0
+streamlit>=1.28.0
+torch>=2.1.0
+torchvision>=0.16.0
+einops>=0.7.0
+pillow>=10.0.0
+scipy>=1.10.0
+imageio>=2.30.0
+imageio-ffmpeg>=0.4.8
+librosa>=0.10.0
+soundfile>=0.12.0
+tqdm>=4.65.0
