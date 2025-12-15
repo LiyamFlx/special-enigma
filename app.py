@@ -1,11 +1,25 @@
-import cv2
-import numpy as np
-import streamlit as st
 import os
-import tempfile
-from video_generator import extend_video_generative
-from audio_processor import process_video_with_audio
-import time
+import sys
+
+# Set environment variables for cloud deployment
+os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'
+os.environ['OMP_NUM_THREADS'] = '1'
+os.environ['MKL_NUM_THREADS'] = '1'
+
+# Import with error handling
+try:
+    import cv2
+    import numpy as np
+    import streamlit as st
+    import tempfile
+    import time
+    from video_generator import extend_video_generative
+    from audio_processor import process_video_with_audio
+except ImportError as e:
+    print(f"Import Error: {e}", file=sys.stderr)
+    import streamlit as st
+    st.error(f"Failed to import required modules: {e}")
+    st.stop()
 
 def extend_video(input_path, output_path, quality_mode="balanced", progress_callback=None):
     """
