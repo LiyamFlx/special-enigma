@@ -70,12 +70,17 @@ def extend_video_optical_flow(input_path, output_path, extension_seconds=5.0, qu
     out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
 
     # Configure DIS optical flow based on quality
-    presets = {
-        "fast": cv2.DISOPTICAL_FLOW_PRESET_ULTRAFAST,
-        "balanced": cv2.DISOPTICAL_FLOW_PRESET_MEDIUM,
-        "quality": cv2.DISOPTICAL_FLOW_PRESET_FAST  # Better quality = FAST preset (more iterations)
-    }
-    dis = cv2.DISOpticalFlow_create(presets.get(quality_mode, cv2.DISOPTICAL_FLOW_PRESET_MEDIUM))
+    # All modes use ULTRAFAST base, but we tune parameters for quality
+    dis = cv2.DISOpticalFlow_create(cv2.DISOPTICAL_FLOW_PRESET_ULTRAFAST)
+    
+    if quality_mode == "balanced":
+        dis.setFinestScale(2)
+        dis.setGradientDescentIterations(12)
+    elif quality_mode == "quality":
+        dis.setFinestScale(1)
+        dis.setGradientDescentIterations(25)
+        dis.setPatchSize(8)
+        dis.setPatchStride(4)
 
     # Read all frames (for extension we need history)
     frames = []
